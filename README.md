@@ -128,6 +128,15 @@ Example configuration:
 - Screenshots are saved as PNG for best quality
 - Original screenshot remains in `.screenshots` folder even after clearing from menu
 
+## Security and Performance Improvements
+
+The application has been updated with the following enhancements:
+- **Memory Management**: Fixed resource leaks for GDI+ objects and clipboard images
+- **Security**: Added path sanitization to prevent command injection vulnerabilities
+- **Performance**: Timer now only runs when auto-save is enabled
+- **Error Handling**: Improved error handling throughout the application
+- **Resource Cleanup**: Proper disposal of all IDisposable objects
+
 ## License
 
 Free to use and modify.

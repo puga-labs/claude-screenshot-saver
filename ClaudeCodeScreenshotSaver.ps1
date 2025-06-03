@@ -1,18 +1,26 @@
 # ClaudeCodeScreenshotSaver.ps1
-# Enhanced tray application with single instance check
+# Enhanced tray application with single instance check and proper resource management
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # Check for existing instance
 $mutex = New-Object System.Threading.Mutex($false, "Global\ClaudeCodeScreenshotSaver_Mutex")
-if (-not $mutex.WaitOne(0, $false)) {
-    [System.Windows.Forms.MessageBox]::Show(
-        "Claude Code Screenshot Saver is already running!`nCheck your system tray.", 
-        "Already Running", 
-        [System.Windows.Forms.MessageBoxButtons]::OK, 
-        [System.Windows.Forms.MessageBoxIcon]::Information
-    )
+$hasHandle = $false
+try {
+    $hasHandle = $mutex.WaitOne(0, $false)
+    if (-not $hasHandle) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Claude Code Screenshot Saver is already running!`nCheck your system tray.", 
+            "Already Running", 
+            [System.Windows.Forms.MessageBoxButtons]::OK, 
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+        exit
+    }
+}
+catch {
+    Write-Error "Failed to check for existing instance: $_"
     exit
 }
 
@@ -25,6 +33,8 @@ Add-Type @"
         public static extern IntPtr GetConsoleWindow();
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")]
+        public static extern bool DestroyIcon(IntPtr hIcon);
     }
 "@
 $consolePtr = [Win32]::GetConsoleWindow()
@@ -35,6 +45,7 @@ $script:autoSaveEnabled = $false
 $script:lastImageHash = ""
 $script:configFile = "$env:APPDATA\ClaudeCodeScreenshotSaver\config.json"
 $script:config = $null
+$script:iconHandles = @()
 
 # Default config
 $defaultConfig = @{
@@ -53,6 +64,7 @@ function Load-Config {
             $script:config = Get-Content $script:configFile | ConvertFrom-Json
         }
         catch {
+            Write-Warning "Failed to load config: $_. Using default config."
             $script:config = $defaultConfig
             Save-Config
         }
@@ -64,7 +76,12 @@ function Load-Config {
 }
 
 function Save-Config {
-    $script:config | ConvertTo-Json | Out-File $script:configFile -Force
+    try {
+        $script:config | ConvertTo-Json | Out-File $script:configFile -Force
+    }
+    catch {
+        Write-Error "Failed to save config: $_"
+    }
 }
 
 # Load config on start
@@ -75,11 +92,16 @@ $script:notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:notifyIcon.Text = "Claude Code Screenshot Saver - OFF"
 $script:notifyIcon.Visible = $true
 
-# Create simple icon (red/green circle)
-{
-    # Create simple icon (red/green circle)
-    function Create-Icon {
-        param($color)
+# Create simple icon (red/green circle) with proper resource management
+function Create-Icon {
+    param($color)
+    
+    $bitmap = $null
+    $graphics = $null
+    $brush = $null
+    $pen = $null
+    
+    try {
         $bitmap = New-Object System.Drawing.Bitmap 16, 16
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $graphics.SmoothingMode = 'AntiAlias'
@@ -92,81 +114,124 @@ $script:notifyIcon.Visible = $true
         $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Black), 1
         $graphics.DrawEllipse($pen, 1, 1, 14, 14)
         
-        $graphics.Dispose()
-        return [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
+        $hicon = $bitmap.GetHicon()
+        $script:iconHandles += $hicon
+        $icon = [System.Drawing.Icon]::FromHandle($hicon)
+        return $icon
     }
-    
-    $script:iconOff = Create-Icon ([System.Drawing.Color]::Red)
-    $script:iconOn = Create-Icon ([System.Drawing.Color]::Green)
-    $script:notifyIcon.Icon = $script:iconOff
+    finally {
+        if ($pen) { $pen.Dispose() }
+        if ($brush) { $brush.Dispose() }
+        if ($graphics) { $graphics.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+    }
+}
+
+$script:iconOff = Create-Icon ([System.Drawing.Color]::Red)
+$script:iconOn = Create-Icon ([System.Drawing.Color]::Green)
+$script:notifyIcon.Icon = $script:iconOff
+
+# Function to sanitize paths for shell execution
+function Get-SanitizedPath {
+    param($path)
+    # Escape single quotes and other shell metacharacters
+    return $path -replace "'", "'\''"
 }
 
 # Function to get Windows path for saving
 function Get-WindowsPath {
     $dir = $script:config.screenshotDir
-    if ($dir -like "/*") {
-        # WSL path
-        $windowsPath = (wsl.exe wslpath -w "$dir" 2>$null).Trim()
-        if (-not $windowsPath) {
-            throw "Failed to convert WSL path"
+    
+    try {
+        if ($dir -like "/*") {
+            # Check if WSL is available
+            $wslCheck = & wsl.exe --version 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "WSL is not available or not running"
+            }
+            
+            # WSL path
+            $sanitizedDir = Get-SanitizedPath $dir
+            $windowsPath = (& wsl.exe wslpath -w "$sanitizedDir" 2>&1)
+            if ($LASTEXITCODE -ne 0 -or -not $windowsPath) {
+                throw "Failed to convert WSL path: $windowsPath"
+            }
+            $windowsPath = $windowsPath.Trim()
+            
+            # Ensure WSL directory exists
+            $result = & wsl.exe bash -c "mkdir -p '$sanitizedDir'" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to create WSL directory: $result"
+            }
         }
-        # Ensure WSL directory exists
-        wsl.exe bash -c "mkdir -p '$dir'" 2>$null
-    }
-    else {
-        # Windows path
-        $windowsPath = $dir
-        if (-not (Test-Path $windowsPath)) {
-            New-Item -ItemType Directory -Path $windowsPath -Force | Out-Null
+        else {
+            # Windows path
+            $windowsPath = $dir
+            if (-not (Test-Path $windowsPath)) {
+                New-Item -ItemType Directory -Path $windowsPath -Force | Out-Null
+            }
         }
+        return $windowsPath
     }
-    return $windowsPath
+    catch {
+        throw "Path error: $_"
+    }
 }
 
-# Function to save screenshot
+# Function to save screenshot with proper resource management
 function Save-ScreenshotToWSL {
     param([bool]$silent = $false)
     
-    if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
-        $image = [System.Windows.Forms.Clipboard]::GetImage()
-        
-        if ($image) {
-            try {
-                $windowsPath = Get-WindowsPath
-                
-                # Generate filename and save
-                $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss-fff"
-                $filename = "screenshot_$timestamp.png"
-                $filepath = Join-Path $windowsPath $filename
-                $image.Save($filepath, [System.Drawing.Imaging.ImageFormat]::Png)
-                
-                # Copy path to clipboard
-                if ($script:config.screenshotDir -like "/*") {
-                    # WSL path
-                    $clipboardPath = "$($script:config.screenshotDir)/$filename"
+    $image = $null
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
+            $image = [System.Windows.Forms.Clipboard]::GetImage()
+            
+            if ($image) {
+                try {
+                    $windowsPath = Get-WindowsPath
+                    
+                    # Generate filename and save
+                    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss-fff"
+                    $filename = "screenshot_$timestamp.png"
+                    $filepath = Join-Path $windowsPath $filename
+                    $image.Save($filepath, [System.Drawing.Imaging.ImageFormat]::Png)
+                    
+                    # Copy path to clipboard
+                    if ($script:config.screenshotDir -like "/*") {
+                        # WSL path
+                        $clipboardPath = "$($script:config.screenshotDir)/$filename"
+                    }
+                    else {
+                        # Windows path
+                        $clipboardPath = $filepath
+                    }
+                    
+                    # Use invoke to handle clipboard access safely
+                    [System.Windows.Forms.Clipboard]::SetText($clipboardPath)
+                    
+                    # Show notification unless silent
+                    if (-not $silent) {
+                        $script:notifyIcon.ShowBalloonTip(2000, "Screenshot Saved", $clipboardPath, [System.Windows.Forms.ToolTipIcon]::Info)
+                    }
+                    
+                    return $true
                 }
-                else {
-                    # Windows path
-                    $clipboardPath = $filepath
+                catch {
+                    if (-not $silent) {
+                        $script:notifyIcon.ShowBalloonTip(2000, "Error", $_.Exception.Message, [System.Windows.Forms.ToolTipIcon]::Error)
+                    }
+                    return $false
                 }
-                [System.Windows.Forms.Clipboard]::SetText($clipboardPath)
-                
-                # Show notification unless silent
-                if (-not $silent) {
-                    $script:notifyIcon.ShowBalloonTip(2000, "Screenshot Saved", $clipboardPath, [System.Windows.Forms.ToolTipIcon]::Info)
-                }
-                
-                return $true
-            }
-            catch {
-                if (-not $silent) {
-                    $script:notifyIcon.ShowBalloonTip(2000, "Error", $_.Exception.Message, [System.Windows.Forms.ToolTipIcon]::Error)
-                }
-                return $false
             }
         }
+        return $false
     }
-    return $false
+    finally {
+        if ($image) {
+            $image.Dispose()
+        }
+    }
 }
 
 # Timer for clipboard monitoring
@@ -174,26 +239,40 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 500
 $timer.Add_Tick({
     if ($script:autoSaveEnabled) {
-        if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
-            $image = [System.Windows.Forms.Clipboard]::GetImage()
-            if ($image) {
-                $memoryStream = New-Object System.IO.MemoryStream
-                $image.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
-                $imageBytes = $memoryStream.ToArray()
-                $currentHash = [System.BitConverter]::ToString(
-                    [System.Security.Cryptography.SHA256]::Create().ComputeHash($imageBytes)
-                )
-                $memoryStream.Dispose()
-                
-                if ($currentHash -ne $script:lastImageHash) {
-                    $script:lastImageHash = $currentHash
-                    Save-ScreenshotToWSL -silent $true
+        $image = $null
+        $memoryStream = $null
+        $sha256 = $null
+        
+        try {
+            if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
+                $image = [System.Windows.Forms.Clipboard]::GetImage()
+                if ($image) {
+                    $memoryStream = New-Object System.IO.MemoryStream
+                    $image.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
+                    $imageBytes = $memoryStream.ToArray()
+                    
+                    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+                    $hashBytes = $sha256.ComputeHash($imageBytes)
+                    $currentHash = [System.BitConverter]::ToString($hashBytes)
+                    
+                    if ($currentHash -ne $script:lastImageHash) {
+                        $script:lastImageHash = $currentHash
+                        Save-ScreenshotToWSL -silent $true
+                    }
                 }
             }
         }
+        catch {
+            # Log error silently to avoid spamming
+            Write-Warning "Timer error: $_"
+        }
+        finally {
+            if ($sha256) { $sha256.Dispose() }
+            if ($memoryStream) { $memoryStream.Dispose() }
+            if ($image) { $image.Dispose() }
+        }
     }
 })
-$timer.Start()
 
 # Function to toggle auto-save
 function Toggle-AutoSave {
@@ -203,11 +282,13 @@ function Toggle-AutoSave {
         $script:notifyIcon.Icon = $script:iconOn
         $script:notifyIcon.Text = "Claude Code Screenshot Saver - ON"
         $script:notifyIcon.ShowBalloonTip(1000, "Auto-save ON", "Screenshots will be saved automatically", [System.Windows.Forms.ToolTipIcon]::Info)
+        $timer.Start()
     }
     else {
         $script:notifyIcon.Icon = $script:iconOff
         $script:notifyIcon.Text = "Claude Code Screenshot Saver - OFF"
         $script:notifyIcon.ShowBalloonTip(1000, "Auto-save OFF", "Screenshots stay in clipboard", [System.Windows.Forms.ToolTipIcon]::Info)
+        $timer.Stop()
     }
 }
 
@@ -234,12 +315,19 @@ function Clear-Screenshots {
     if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
         try {
             if ($script:config.screenshotDir -like "/*") {
-                # WSL path
-                wsl.exe bash -c "rm -f '$($script:config.screenshotDir)'/*.png" 2>$null
+                # WSL path - use sanitized path
+                $sanitizedDir = Get-SanitizedPath $script:config.screenshotDir
+                $result = & wsl.exe bash -c "find '$sanitizedDir' -name '*.png' -type f -delete" 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Failed to delete files: $result"
+                }
             }
             else {
                 # Windows path
-                Remove-Item "$($script:config.screenshotDir)\*.png" -Force
+                $pngFiles = Get-ChildItem "$($script:config.screenshotDir)\*.png" -ErrorAction SilentlyContinue
+                if ($pngFiles) {
+                    Remove-Item $pngFiles -Force -ErrorAction Stop
+                }
             }
             $script:notifyIcon.ShowBalloonTip(2000, "Cleared", "All screenshots deleted", [System.Windows.Forms.ToolTipIcon]::Info)
         }
@@ -308,9 +396,24 @@ function Change-Folder {
     if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $newPath = $textBox.Text.Trim()
         if ($newPath) {
-            $script:config.screenshotDir = $newPath
-            Save-Config
-            $script:notifyIcon.ShowBalloonTip(2000, "Folder Changed", "Screenshots will be saved to:`n$newPath", [System.Windows.Forms.ToolTipIcon]::Info)
+            # Validate the path before saving
+            try {
+                $script:config.screenshotDir = $newPath
+                # Test if we can access the path
+                $testPath = Get-WindowsPath
+                Save-Config
+                $script:notifyIcon.ShowBalloonTip(2000, "Folder Changed", "Screenshots will be saved to:`n$newPath", [System.Windows.Forms.ToolTipIcon]::Info)
+            }
+            catch {
+                # Revert to previous path
+                Load-Config
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Invalid path: $_", 
+                    "Error", 
+                    [System.Windows.Forms.MessageBoxButtons]::OK, 
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                )
+            }
         }
     }
 }
@@ -369,7 +472,15 @@ $contextMenu.Items.Add("Exit", $null, {
     $timer.Dispose()
     $script:notifyIcon.Visible = $false
     $script:notifyIcon.Dispose()
-    $mutex.ReleaseMutex()
+    
+    # Clean up icon handles
+    foreach ($handle in $script:iconHandles) {
+        [Win32]::DestroyIcon($handle)
+    }
+    
+    if ($hasHandle) {
+        $mutex.ReleaseMutex()
+    }
     $mutex.Dispose()
     [System.Windows.Forms.Application]::Exit()
 })
@@ -391,6 +502,9 @@ $script:notifyIcon.Add_MouseDoubleClick({
 
 # Show initial tooltip
 $script:notifyIcon.ShowBalloonTip(3000, "Claude Code Screenshot Saver", "Right-click for menu`nDouble-click to toggle auto-save", [System.Windows.Forms.ToolTipIcon]::Info)
+
+# Start timer (will only tick if auto-save is enabled)
+$timer.Start()
 
 # Create application context and run
 $appContext = New-Object System.Windows.Forms.ApplicationContext
